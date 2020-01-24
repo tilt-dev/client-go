@@ -79,12 +79,27 @@ type Reflector struct {
 	// WatchListPageSize is the requested chunk size of initial and resync watch lists.
 	// Defaults to pager.PageSize.
 	WatchListPageSize int64
+
+	// Called whenever the ListAndWatch drops a connection, whether or not
+	// the connection had an error. So that clients can handle errors
+	// and implement backoff.
+	dropWatchHandler DropWatchHandler
+}
+
+type DropWatchHandler func(err error, doneCh <-chan struct{})
+
+func createDefaultDropWatchHandler(name string) DropWatchHandler {
+	return func(err error, doneCh <-chan struct{}) {
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("%s: %v", name, err))
+		}
+	}
 }
 
 var (
 	// We try to spread the load on apiserver by setting timeouts for
 	// watch requests - it is random in [minWatchTimeout, 2*minWatchTimeout].
-	minWatchTimeout = 5 * time.Minute
+	minWatchTimeout = time.Minute
 )
 
 // NewNamespaceKeyedIndexerAndReflector creates an Indexer and a Reflector
@@ -108,12 +123,14 @@ func NewReflector(lw ListerWatcher, expectedType interface{}, store Store, resyn
 // NewNamedReflector same as NewReflector, but with a specified name for logging
 func NewNamedReflector(name string, lw ListerWatcher, expectedType interface{}, store Store, resyncPeriod time.Duration) *Reflector {
 	r := &Reflector{
-		name:          name,
-		listerWatcher: lw,
-		store:         store,
-		period:        time.Second,
-		resyncPeriod:  resyncPeriod,
-		clock:         &clock.RealClock{},
+		name:             name,
+		listerWatcher:    lw,
+		store:            store,
+		expectedType:     reflect.TypeOf(expectedType),
+		period:           time.Second,
+		resyncPeriod:     resyncPeriod,
+		clock:            &clock.RealClock{},
+		dropWatchHandler: createDefaultDropWatchHandler(name),
 	}
 	r.setExpectedType(expectedType)
 	return r
@@ -149,9 +166,8 @@ var internalPackages = []string{"client-go/tools/cache/"}
 func (r *Reflector) Run(stopCh <-chan struct{}) {
 	klog.V(3).Infof("Starting reflector %v (%s) from %s", r.expectedTypeName, r.resyncPeriod, r.name)
 	wait.Until(func() {
-		if err := r.ListAndWatch(stopCh); err != nil {
-			utilruntime.HandleError(err)
-		}
+		err := r.ListAndWatch(stopCh)
+		r.dropWatchHandler(err, stopCh)
 	}, r.period, stopCh)
 }
 
@@ -223,22 +239,22 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		case <-listCh:
 		}
 		if err != nil {
-			return fmt.Errorf("%s: Failed to list %v: %v", r.name, r.expectedTypeName, err)
+			return fmt.Errorf("Failed to list %v: %v", r.expectedTypeName, err)
 		}
 		initTrace.Step("Objects listed")
 		listMetaInterface, err := meta.ListAccessor(list)
 		if err != nil {
-			return fmt.Errorf("%s: Unable to understand list result %#v: %v", r.name, list, err)
+			return fmt.Errorf("Unable to understand list result %#v: %v", list, err)
 		}
 		resourceVersion = listMetaInterface.GetResourceVersion()
 		initTrace.Step("Resource version extracted")
 		items, err := meta.ExtractList(list)
 		if err != nil {
-			return fmt.Errorf("%s: Unable to understand list result %#v (%v)", r.name, list, err)
+			return fmt.Errorf("Unable to understand list result %#v (%v)", list, err)
 		}
 		initTrace.Step("Objects extracted")
 		if err := r.syncWith(items, resourceVersion); err != nil {
-			return fmt.Errorf("%s: Unable to sync list result: %v", r.name, err)
+			return fmt.Errorf("Unable to sync list result: %v", err)
 		}
 		initTrace.Step("SyncWith done")
 		r.setLastSyncResourceVersion(resourceVersion)
@@ -298,14 +314,6 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 
 		w, err := r.listerWatcher.Watch(options)
 		if err != nil {
-			switch err {
-			case io.EOF:
-				// watch closed normally
-			case io.ErrUnexpectedEOF:
-				klog.V(1).Infof("%s: Watch for %v closed with unexpected EOF: %v", r.name, r.expectedTypeName, err)
-			default:
-				utilruntime.HandleError(fmt.Errorf("%s: Failed to watch %v: %v", r.name, r.expectedTypeName, err))
-			}
 			// If this is "connection refused" error, it means that most likely apiserver is not responsive.
 			// It doesn't make sense to re-list all objects because most likely we will be able to restart
 			// watch where we ended.
@@ -314,7 +322,15 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 				time.Sleep(time.Second)
 				continue
 			}
-			return nil
+
+			if err == io.EOF {
+				// watch closed normally
+				return nil
+			} else if err == io.ErrUnexpectedEOF {
+				klog.V(1).Infof("%s: Watch for %v closed with unexpected EOF: %v", r.name, r.expectedTypeName, err)
+			}
+
+			return err
 		}
 
 		if err := r.watchHandler(w, &resourceVersion, resyncerrc, stopCh); err != nil {

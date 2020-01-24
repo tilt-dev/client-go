@@ -61,6 +61,11 @@ type Config struct {
 	//       the object completely if desired. Pass the object in
 	//       question to this interface as a parameter.
 	RetryOnError bool
+
+	// Called whenever the ListAndWatch drops a connection, whether or not
+	// the connection had an error. So that clients can handle errors
+	// and implement backoff.
+	DropWatchHandler DropWatchHandler
 }
 
 // ShouldResyncFunc is a type of function that indicates if a reflector should perform a
@@ -112,6 +117,9 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 	)
 	r.ShouldResync = c.config.ShouldResync
 	r.clock = c.clock
+	if c.config.DropWatchHandler != nil {
+		r.dropWatchHandler = c.config.DropWatchHandler
+	}
 
 	c.reflectorMutex.Lock()
 	c.reflector = r

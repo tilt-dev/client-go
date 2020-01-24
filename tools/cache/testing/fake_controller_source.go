@@ -22,7 +22,7 @@ import (
 	"strconv"
 	"sync"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -59,6 +59,9 @@ type FakeControllerSource struct {
 	Items       map[nnu]runtime.Object
 	changes     []watch.Event // one change per resourceVersion
 	Broadcaster *watch.Broadcaster
+
+	// Set this to simulate an error on List()
+	ListError error
 }
 
 type FakePVControllerSource struct {
@@ -161,6 +164,11 @@ func (f *FakeControllerSource) getListItemsLocked() ([]runtime.Object, error) {
 func (f *FakeControllerSource) List(options metav1.ListOptions) (runtime.Object, error) {
 	f.lock.RLock()
 	defer f.lock.RUnlock()
+
+	if f.ListError != nil {
+		return nil, f.ListError
+	}
+
 	list, err := f.getListItemsLocked()
 	if err != nil {
 		return nil, err
